@@ -10,6 +10,11 @@ extern "C" void mysleep() {
     sleep(1);
 }
 
+void hello()
+{
+    printf("hello\n");
+}
+
 int main() {
     void *handle = dlopen(LIBTEST_PATH, RTLD_LAZY);
 
@@ -21,6 +26,7 @@ int main() {
         if (libtest(n++)) {
             break;
         }
+        hello();
         mysleep();
     }
 

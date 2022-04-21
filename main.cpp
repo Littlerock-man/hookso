@@ -1331,7 +1331,7 @@ const uint64_t GLOBAL_MEM_HEAD_MAGIC = 0xdead0dad0dadbeef;
 const char GLOBAL_MEM_HEAD_MAGIC_NAME[] = "hookso00";
 #pragma pack(1)
 
-int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len, void *&targetaddr, int &targetlen) {
+int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len, void *&targetaddr, int &targetlen, uint64_t mem_find) {
     char name[8];
     name[sizeof(name) - 1] = 0;
     strncpy(name, namestr.c_str(), sizeof(name) - 1);
@@ -1350,7 +1350,7 @@ int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len,
     }
 
     for (int i = 0; i < (int) mapping.size(); ++i) {
-        if (mapping[i].first >= 0xFFFFFFFF || mapping[i].second >= 0xFFFFFFFF) {
+        if (mapping[i].first >= 0x7F0000000000 || mapping[i].second >= 0x7F0000000000) {
             continue;
         }
 
@@ -1396,7 +1396,7 @@ int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len,
     LOG("get_mem_mapping not find old one, start alloc");
 
     for (int i = 0; i < (int) mapping.size(); ++i) {
-        if (mapping[i].first >= 0xFFFFFFFF || mapping[i].second >= 0xFFFFFFFF) {
+        if (mapping[i].first >= 0x7F0000000000 || mapping[i].second >= 0x7F0000000000) {
             continue;
         }
 
@@ -1459,9 +1459,10 @@ int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len,
 
     LOG("get_mem_mapping not alloc from old, start alloc new page");
 
-    uint64_t find = (uint64_t) 0x00400000;
+//    uint64_t find = (uint64_t) 0x55becc3e8000;
+    uint64_t find = mem_find;
     for (int i = 0; i < (int) mapping.size(); ++i) {
-        if (mapping[i].first >= 0xFFFFFFFF || mapping[i].second >= 0xFFFFFFFF) {
+        if (mapping[i].first >= 0x7F0000000000 || mapping[i].second >= 0x7F0000000000) {
             continue;
         }
 
@@ -1469,11 +1470,11 @@ int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len,
             find = mapping[i].second;
             continue;
         }
-
         break;
     }
 
-    if (find == (uint64_t) 0x00400000) {
+//    if (find == (uint64_t) 0x55becc3e8000) {
+    if (find == mem_find) {
         ERR("alloc_global_mem fail can no find page");
         return -1;
     }
@@ -2319,6 +2320,7 @@ int program_replacep(int argc, char **argv) {
     std::string srcaddr = argv[3];
     std::string targetso = argv[4];
     std::string targetfunc = argv[5];
+    std::string findstr = argv[6];
 
     LOG("pid=%s", pidstr.c_str());
     LOG("src function addr=%s", srcaddr.c_str());
@@ -2326,6 +2328,13 @@ int program_replacep(int argc, char **argv) {
     LOG("target function=%s", targetfunc.c_str());
 
     int pid = atoi(pidstr.c_str());
+    uint64_t mem_find = 0;
+    if (findstr.find("0x") != std::string::npos) {
+        mem_find = std::stoull(findstr.c_str(), nullptr, 0);
+    } else {
+        mem_find = std::stoull(findstr.c_str());
+    }
+    LOG("start memory addr=%s=%ld", findstr.c_str(), mem_find);
 
     void *old_funcaddr = (void *) std::stoull(srcaddr.c_str());
 
@@ -2392,7 +2401,7 @@ int program_replacep(int argc, char **argv) {
         void *far_jmpq_addr_pointer = 0;
         int far_jmpq_addr_pointer_len = 0;
         ret = alloc_global_mem(pid, "replace", (uint64_t) old_funcaddr, sizeof(new_funcaddr), far_jmpq_addr_pointer,
-                               far_jmpq_addr_pointer_len);
+                               far_jmpq_addr_pointer_len, mem_find);
         if (ret < 0) {
             close_so(pid, handle);
             return -1;
