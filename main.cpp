@@ -30,7 +30,8 @@
 #include <unistd.h>
 #include <linux/limits.h>
 #include <inttypes.h>
-#include <elf.h>
+#include <libelf.h>
+#include <gelf.h>
 #include <sys/uio.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
@@ -932,6 +933,58 @@ int find_so_func_addr(int pid, const std::string &so,
     }
 }
 
+void *get_process_func_v_addr(int pid, const std::string &needle, const std::string &func) {
+    std::string maps_path = "/proc/" + std::to_string(pid) + "/maps";
+    FILE *fp = fopen(maps_path.c_str(), "r");
+    std::string file_path;
+    ptrdiff_t load_offset = 0;
+    char read_buffer[BUFSIZ];
+    while (fgets(read_buffer, sizeof(read_buffer), fp)) {
+        char *sep = strrchr(read_buffer, ' ');
+        assert(sep);
+        file_path = sep + 1;
+        while (file_path.back() == '\n')
+            file_path.resize(file_path.size() - 1);
+        if (file_path[0] != '/' || file_path.find(needle) == std::string::npos) {
+            file_path.clear();
+            continue;
+        }
+        /* Assuming first located map is offset 00000000 */
+        load_offset = strtoull(read_buffer, nullptr, 16);
+        break;
+    }
+    fclose(fp);
+    if (!load_offset)
+        return nullptr;
+
+    int elf_fd = open(file_path.c_str(), O_RDONLY);
+    assert(elf_fd != -1);
+    Elf *elf = elf_begin(elf_fd, ELF_C_READ_MMAP,nullptr);
+    assert(elf);
+    ptrdiff_t sym_offset = 0;
+    Elf_Scn *scn = nullptr;
+    while ((scn = elf_nextscn(elf, scn))) {
+        GElf_Shdr scn_hdr;
+        gelf_getshdr(scn, &scn_hdr);
+        Elf_Data *data = elf_getdata(scn, nullptr);
+        if (scn_hdr.sh_type == SHT_DYNSYM || scn_hdr.sh_type == SHT_SYMTAB) {
+            size_t n_sym = scn_hdr.sh_size / scn_hdr.sh_entsize;
+            for (int i = 0; i < n_sym; i++) {
+                GElf_Sym sym;
+                gelf_getsym(data, i, &sym);
+                std::string sym_name = elf_strptr(elf, scn_hdr.sh_link, sym.st_name);
+                if (func == sym_name && GELF_ST_TYPE(sym.st_info) == STT_FUNC) {
+                    sym_offset = sym.st_value;
+                    break;
+                }
+            }
+        }
+    }
+    elf_end(elf);
+    close(elf_fd);
+    return sym_offset ? (void *)(load_offset + sym_offset) : nullptr;
+}
+
 bool ends_with(const std::string &str, const std::string &suffix) {
     return str.size() >= suffix.size() && 0 == str.compare(str.size() - suffix.size(), suffix.size(), suffix);
 }
@@ -970,6 +1023,9 @@ int find_libc_name(int pid, std::string &name, void *&psostart) {
         if (tmp.empty()) {
             continue;
         }
+        
+        if (tmp[1] != "r-xp")
+            continue;
 
         std::string path = tmp[tmp.size() - 1];
         if (path == "(deleted)") {
@@ -1459,7 +1515,7 @@ int alloc_global_mem(int pid, const std::string &namestr, uint64_t key, int len,
 
     LOG("get_mem_mapping not alloc from old, start alloc new page");
 
-    uint64_t find = mapping[0].second;
+    uint64_t find = mapping[5].second;
 
     LOG("get_mem_mapping alloc new page at %p", (void *) find);
 
@@ -1633,18 +1689,14 @@ int inject_so(int pid, const std::string &sopath, uint64_t &handle) {
     }
     LOG("start inject so %s", abspath);
 
-    std::vector<void *> libc_dlopen_mode_funcaddr_plt;
-    void *libc_dlopen_mode_funcaddr = 0;
-    int ret = find_so_func_addr(pid, glibcname, "__libc_dlopen_mode", libc_dlopen_mode_funcaddr_plt,
-                                libc_dlopen_mode_funcaddr);
-    if (ret != 0) {
+    void *libc_dlopen_mode_funcaddr = get_process_func_v_addr(pid, glibcname, "__libc_dlopen_mode");
+    if (!libc_dlopen_mode_funcaddr)
         return -1;
-    }
-    LOG("libc %s func __libc_dlopen_mode is %p", glibcname.c_str(), libc_dlopen_mode_funcaddr);
+    LOG("libc %s func  is %p", glibcname.c_str(), libc_dlopen_mode_funcaddr);
 
     void *dlopen_straddr = 0;
     int dlopen_strlen = 0;
-    ret = alloc_so_string_mem(pid, abspath, dlopen_straddr, dlopen_strlen);
+    int ret = alloc_so_string_mem(pid, abspath, dlopen_straddr, dlopen_strlen);
     if (ret != 0) {
         return -1;
     }
@@ -1762,17 +1814,14 @@ int close_so(int pid, uint64_t handle) {
 
     LOG("start close so %lu", handle);
 
-    std::vector<void *> libc_dlclose_funcaddr_plt;
-    void *libc_dlclose_funcaddr = 0;
-    int ret = find_so_func_addr(pid, glibcname, "__libc_dlclose", libc_dlclose_funcaddr_plt,
-                                libc_dlclose_funcaddr);
-    if (ret != 0) {
+    void *libc_dlclose_funcaddr = get_process_func_v_addr(pid, glibcname, "__libc_dlclose");
+    if (!libc_dlclose_funcaddr) {
         return -1;
     }
     LOG("libc %s func __libc_dlclose is %p", glibcname.c_str(), libc_dlclose_funcaddr);
 
     uint64_t retval = 0;
-    ret = funccall_so(pid, retval, libc_dlclose_funcaddr, handle);
+    int ret = funccall_so(pid, retval, libc_dlclose_funcaddr, handle);
     if (ret != 0) {
         return -1;
     }
@@ -1859,10 +1908,8 @@ int program_dlcall_impl(int pid, const std::string &targetso, const std::string 
 
     LOG("start parse so file %s %s", targetso.c_str(), targetfunc.c_str());
 
-    std::vector<void *> target_funcaddr_plt;
-    void *target_funcaddr = 0;
-    ret = find_so_func_addr(pid, targetso.c_str(), targetfunc.c_str(), target_funcaddr_plt, target_funcaddr);
-    if (ret != 0) {
+    void *target_funcaddr = get_process_func_v_addr(pid, targetso, targetfunc);
+    if (!target_funcaddr) {
         close_so(pid, handle);
         return -1;
     }
@@ -1929,15 +1976,13 @@ int program_call_impl(int pid, const std::string &targetso, const std::string &t
 
     LOG("start parse so file %s %s", targetso.c_str(), targetfunc.c_str());
 
-    std::vector<void *> target_funcaddr_plt;
-    void *target_funcaddr = 0;
-    int ret = find_so_func_addr(pid, targetso.c_str(), targetfunc.c_str(), target_funcaddr_plt, target_funcaddr);
-    if (ret != 0) {
+    void *target_funcaddr = get_process_func_v_addr(pid, targetso, targetfunc);
+    if (!target_funcaddr) {
         return -1;
     }
 
     uint64_t retval = 0;
-    ret = funccall_so(pid, retval, target_funcaddr, arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]);
+    int ret = funccall_so(pid, retval, target_funcaddr, arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]);
     if (ret != 0) {
         return -1;
     }
@@ -2053,9 +2098,8 @@ int program_find(int argc, char **argv) {
     LOG("start parse so file %s %s", targetso.c_str(), targetfunc.c_str());
 
     std::vector<void *> old_funcaddr_plt;
-    void *old_funcaddr = 0;
-    int ret = find_so_func_addr(pid, targetso.c_str(), targetfunc.c_str(), old_funcaddr_plt, old_funcaddr);
-    if (ret != 0) {
+    void *old_funcaddr = get_process_func_v_addr(pid, targetso, targetfunc);
+    if (!old_funcaddr) {
         return -1;
     }
 
@@ -2326,15 +2370,11 @@ int program_replacep(int argc, char **argv) {
 
     LOG("start parse so file %s %s", targetso.c_str(), targetfunc.c_str());
 
-    std::vector<void *> new_funcaddr_plt;
-    void *new_funcaddr = 0;
-    ret = find_so_func_addr(pid, targetso.c_str(), targetfunc.c_str(), new_funcaddr_plt, new_funcaddr);
-    if (ret != 0) {
+    void *new_funcaddr = get_process_func_v_addr(pid, targetso, targetfunc);
+    if (!new_funcaddr) {
         close_so(pid, handle);
         return -1;
     }
-
-    LOG("new %s %s=%p offset=%d", targetso.c_str(), targetfunc.c_str(), new_funcaddr, new_funcaddr_plt.size());
 
     uint64_t backup = 0;
     ret = remote_process_read(pid, old_funcaddr, &backup, sizeof(backup));
@@ -2939,6 +2979,7 @@ int main(int argc, char **argv) {
     std::string type = argv[1];
     std::string pidstr = argv[2];
 
+    elf_version(EV_CURRENT);
     int pid = atoi(pidstr.c_str());
 
     int ret = ini_hookso_env(pid);
